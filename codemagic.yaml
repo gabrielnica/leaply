@@ -39,6 +39,8 @@ workflows:
         script: |
           set -e
           cd "$CM_BUILD_DIR/leaply-mobile"
+          # fix: ^6.1.0 nu există pe npm pentru plugin-ul de biometrie (Capacitor 6 → 6.0.x)
+          npm pkg set "dependencies.@capgo/capacitor-native-biometric=^6.0.4"
           npm install
           npx cap add ios
 
