@@ -1,0 +1,233 @@
+# Codemagic CI — Leaply iOS → TestFlight
+# ============================================================================
+# Build complet în cloud (fără Mac local):
+#   1. extrage leaply-mobile/ din leaply-src.tar.gz
+#   2. generează proiectul nativ iOS cu Capacitor (npx cap add ios)
+#   3. icons & splash din assets/
+#   4. injectează config Firebase (GoogleService-Info.plist), AppDelegate cu
+#      FCM (APNs token → FCM token), entitlements push, Face ID string
+#   5. semnare automată App Store (integrations.app_store_connect) + build ipa
+#   6. upload automat pe TestFlight
+# Numele integrării ASC din Codemagic UI trebuie să fie exact: leaply-asc
+# ============================================================================
+workflows:
+  ios-testflight:
+    name: Leaply iOS → TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    integrations:
+      app_store_connect: leaply-asc
+    environment:
+      xcode: latest
+      cocoapods: default
+      node: 22
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: ro.leaply.app
+      vars:
+        APP_STORE_APPLE_ID: "6789469829"
+        MARKETING_VERSION: "1.0.0"
+    scripts:
+      - name: Extract mobile source from tarball
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          tar xzf leaply-src.tar.gz leaply-mobile
+          ls leaply-mobile
+
+      - name: Install deps + create native iOS project
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          npm install
+          npx cap add ios
+
+      - name: Generate icons & splash
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          npm run assets -- --ios || npx capacitor-assets generate --ios
+
+      - name: Sync Capacitor
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          npx cap sync ios
+
+      - name: Inject Firebase config (GoogleService-Info.plist)
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          cat > ios/App/App/GoogleService-Info.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>API_KEY</key>
+            <string>AIzaSyCUCvjAzkakI5ToKgmpw4tY0dBXYsibLW8</string>
+            <key>GCM_SENDER_ID</key>
+            <string>252438390702</string>
+            <key>PLIST_VERSION</key>
+            <string>1</string>
+            <key>BUNDLE_ID</key>
+            <string>ro.leaply.app</string>
+            <key>PROJECT_ID</key>
+            <string>leaply-44773</string>
+            <key>STORAGE_BUCKET</key>
+            <string>leaply-44773.firebasestorage.app</string>
+            <key>IS_ADS_ENABLED</key>
+            <false/>
+            <key>IS_ANALYTICS_ENABLED</key>
+            <false/>
+            <key>IS_APPINVITE_ENABLED</key>
+            <true/>
+            <key>IS_GCM_ENABLED</key>
+            <true/>
+            <key>IS_SIGNIN_ENABLED</key>
+            <true/>
+            <key>GOOGLE_APP_ID</key>
+            <string>1:252438390702:ios:3238dd8d405e19a6120a3f</string>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: AppDelegate with FCM token mapping
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          cat > ios/App/App/AppDelegate.swift <<'SWIFT'
+          import UIKit
+          import Capacitor
+          import FirebaseCore
+          import FirebaseMessaging
+
+          @UIApplicationMain
+          class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
+              var window: UIWindow?
+
+              func application(_ application: UIApplication,
+                               didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+                  FirebaseApp.configure()
+                  Messaging.messaging().delegate = self
+                  return true
+              }
+
+              func application(_ app: UIApplication, open url: URL,
+                               options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+                  return ApplicationDelegateProxy.shared.application(app, open: url, options: options)
+              }
+
+              func application(_ application: UIApplication, continue userActivity: NSUserActivity,
+                               restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void) -> Bool {
+                  return ApplicationDelegateProxy.shared.application(application, continue: userActivity,
+                                                                     restorationHandler: restorationHandler)
+              }
+
+              // APNs a livrat token-ul de device → îl dăm la Firebase, iar spre
+              // JavaScript (Capacitor PushNotifications 'registration') trimitem
+              // token-ul FCM, pentru că serverul Leaply trimite prin FCM HTTP v1.
+              func application(_ application: UIApplication,
+                               didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+                  Messaging.messaging().apnsToken = deviceToken
+                  Messaging.messaging().token { token, error in
+                      if let token = token {
+                          NotificationCenter.default.post(name: .capacitorDidRegisterForRemoteNotifications, object: token)
+                      } else {
+                          NotificationCenter.default.post(name: .capacitorDidFailToRegisterForRemoteNotifications,
+                                                          object: error ?? NSError(domain: "fcm", code: -1))
+                      }
+                  }
+              }
+
+              func application(_ application: UIApplication,
+                               didFailToRegisterForRemoteNotificationsWithError error: Error) {
+                  NotificationCenter.default.post(name: .capacitorDidFailToRegisterForRemoteNotifications, object: error)
+              }
+
+              // Token FCM rotit/reînnoit în timpul vieții aplicației.
+              func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+                  if let token = fcmToken {
+                      NotificationCenter.default.post(name: .capacitorDidRegisterForRemoteNotifications, object: token)
+                  }
+              }
+          }
+          SWIFT
+
+      - name: Entitlements + Info.plist (push, Face ID, versiune)
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          cat > ios/App/App/App.entitlements <<'ENT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>aps-environment</key>
+            <string>production</string>
+          </dict>
+          </plist>
+          ENT
+          PLIST_FILE=ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSFaceIDUsageDescription string 'Leaply folosește Face ID pentru a debloca aplicația în siguranță.'" "$PLIST_FILE" || \
+            /usr/libexec/PlistBuddy -c "Set :NSFaceIDUsageDescription 'Leaply folosește Face ID pentru a debloca aplicația în siguranță.'" "$PLIST_FILE"
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST_FILE" || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string remote-notification" "$PLIST_FILE" || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $MARKETING_VERSION" "$PLIST_FILE"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$PLIST_FILE"
+
+      - name: Add FirebaseMessaging pod
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile/ios/App"
+          if ! grep -q "FirebaseMessaging" Podfile; then
+            # inserăm în target 'App', imediat după capacitor_pods
+            perl -0pi -e "s/(target 'App' do\s*\n\s*capacitor_pods)/\$1\n  pod 'FirebaseMessaging'/" Podfile
+          fi
+          grep -n "FirebaseMessaging" Podfile
+          pod install --repo-update
+
+      - name: Patch Xcode project (plist resource + entitlements)
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          ruby <<'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('ios/App/App.xcodeproj')
+          target = project.targets.find { |t| t.name == 'App' }
+          app_group = project.main_group['App']
+
+          # GoogleService-Info.plist ca resursă în target
+          unless app_group.files.any? { |f| f.path.to_s.include?('GoogleService-Info') }
+            ref = app_group.new_file('GoogleService-Info.plist')
+            target.resources_build_phase.add_file_reference(ref)
+          end
+
+          # Entitlements pe toate configurațiile
+          target.build_configurations.each do |config|
+            config.build_settings['CODE_SIGN_ENTITLEMENTS'] = 'App/App.entitlements'
+          end
+          project.save
+          puts 'Xcode project patched OK'
+          RUBY
+
+      - name: Apply signing profiles
+        script: |
+          set -e
+          xcode-project use-profiles
+
+      - name: Build IPA
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          xcode-project build-ipa \
+            --workspace ios/App/App.xcworkspace \
+            --scheme App
+
+    artifacts:
+      - leaply-mobile/build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
