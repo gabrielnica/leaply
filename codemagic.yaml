@@ -235,3 +235,80 @@ workflows:
       app_store_connect:
         auth: integration
         submit_to_testflight: true
+
+  # ============================================================================
+  # ANDROID → Google Play (.aab semnat, artifact de descărcat manual)
+  # Workflow SEPARAT — nu atinge pipeline-ul iOS validat. Se pornește MANUAL
+  # din Codemagic după ce configurezi în UI grupul de env `android_signing`:
+  #   CM_KEYSTORE            = keystore-ul .jks în base64  (generezi: keytool -genkey -v \
+  #                            -keystore leaply-upload.jks -alias leaply -keyalg RSA -keysize 2048 -validity 10000)
+  #   CM_KEYSTORE_PASSWORD   = parola keystore-ului
+  #   CM_KEY_ALIAS           = leaply
+  #   CM_KEY_PASSWORD        = parola cheii
+  #   GOOGLE_SERVICES_JSON   = google-services.json (base64) din Firebase leaply-44773
+  #                            (Project settings → Add app → Android, pachet ro.leaply.app)
+  # După primul build: descarci .aab din Artifacts → Play Console → Internal testing.
+  # ============================================================================
+  android-play:
+    name: Leaply Android (.aab pentru Google Play)
+    instance_type: linux_x2
+    max_build_duration: 45
+    environment:
+      groups:
+        - android_signing
+      vars:
+        PACKAGE_NAME: "ro.leaply.app"
+      node: 20
+      java: 17
+    scripts:
+      - name: Extrage sursa mobilă din tarball
+        script: |
+          cd "$CM_BUILD_DIR"
+          tar xzf leaply-src.tar.gz leaply-mobile
+          ls leaply-mobile
+
+      - name: Dependențe + proiect Android generat de Capacitor
+        script: |
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          npm install
+          npx cap add android
+          npx @capacitor/assets generate --android || echo "assets: continuăm cu iconițele default"
+          npx cap sync android
+
+      - name: google-services.json (push FCM)
+        script: |
+          cd "$CM_BUILD_DIR/leaply-mobile"
+          if [ -n "${GOOGLE_SERVICES_JSON:-}" ]; then
+            echo "$GOOGLE_SERVICES_JSON" | base64 --decode > android/app/google-services.json
+            echo "google-services.json instalat"
+          else
+            echo "AVERTISMENT: GOOGLE_SERVICES_JSON lipsește — build-ul merge, dar push-ul FCM NU va funcționa."
+          fi
+
+      - name: Versiune (versionCode din numărul de build Codemagic)
+        script: |
+          cd "$CM_BUILD_DIR/leaply-mobile/android/app"
+          BUILD_NO="${PROJECT_BUILD_NUMBER:-1}"
+          sed -i "s/versionCode 1$/versionCode $BUILD_NO/" build.gradle
+          sed -i 's/versionName "1.0"$/versionName "1.0.0"/' build.gradle
+          grep -E "versionCode|versionName" build.gradle | head -2
+
+      - name: Keystore de semnare
+        script: |
+          if [ -z "${CM_KEYSTORE:-}" ]; then
+            echo "EROARE: configurează grupul android_signing în Codemagic UI (vezi comentariul workflow-ului)"; exit 1
+          fi
+          echo "$CM_KEYSTORE" | base64 --decode > /tmp/keystore.jks
+
+      - name: Build .aab semnat
+        script: |
+          cd "$CM_BUILD_DIR/leaply-mobile/android"
+          ./gradlew bundleRelease \
+            -Pandroid.injected.signing.store.file=/tmp/keystore.jks \
+            -Pandroid.injected.signing.store.password="$CM_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$CM_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$CM_KEY_PASSWORD"
+          ls -la app/build/outputs/bundle/release/
+
+    artifacts:
+      - leaply-mobile/android/app/build/outputs/**/*.aab
